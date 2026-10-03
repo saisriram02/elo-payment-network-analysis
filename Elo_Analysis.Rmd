@@ -1,0 +1,1322 @@
+---
+title: "What Kind of Payment Network Are We?"
+subtitle: "A portfolio-level review of the Elo card ledger, merchant base and promotions programme"
+author: "Team ERROR 404"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_float:
+      collapsed: false
+    toc_depth: 3
+    number_sections: true
+    df_print: paged
+    code_folding: show
+    fig_width: 9
+    fig_height: 4.8
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.align = "center", dpi = 120)
+
+## Install anything missing, then load. Nothing here is exotic.
+need <- c("dplyr", "ggplot2", "tidyr", "scales", "knitr")
+for (pkg in need)
+  if (!requireNamespace(pkg, quietly = TRUE))
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+suppressPackageStartupMessages({
+  library(dplyr); library(ggplot2); library(tidyr); library(scales); library(knitr)
+})
+options(scipen = 999)
+set.seed(404)
+
+elo_theme <- theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        plot.title    = element_text(face = "bold", size = 13),
+        plot.subtitle = element_text(colour = "grey35", size = 10),
+        plot.caption  = element_text(colour = "grey50", size = 8, hjust = 0),
+        legend.position = "top")
+theme_set(elo_theme)
+PAL <- c("#1F4E79", "#2E86AB", "#7FB3D5", "#E8A33D", "#C0504D", "#7F7F7F")
+
+DATA_DIR <- "Data"
+read_fast <- function(path) {
+  if (requireNamespace("data.table", quietly = TRUE)) {
+    as.data.frame(data.table::fread(path, showProgress = FALSE, na.strings = c("", "NA")))
+  } else {
+    read.csv(path, na.strings = c("", "NA"))
+  }
+}
+```
+
+# The brief, and how we chose to answer it
+
+The Board asked one question: **based on everything in this data, what kind of
+payment network are we, and what should that tell us about where to point the
+promotions programme in Quarter 4?**
+
+That is deliberately not a modelling question. Nobody is asking for an uplift
+score. They are asking for an identity — and then for the operating consequence
+of that identity. So we structured the work as a chain of questions, each one
+earning the right to ask the next:
+
+| # | Question | Why it has to come first |
+|---|----------|--------------------------|
+| 1 | Can we even read the money? | `purchase_amount` is normalised. Without real currency no finding is presentable to a Board. |
+| 2 | Is the data telling the truth? | A currency transform we recovered ourselves has to be tested, not assumed. |
+| 3 | Who transacts on our cards? | Concentration decides whether promotions are a mass-market or a targeted instrument. |
+| 4 | How is the network actually used? | Ticket size and instalment behaviour *are* the identity answer. |
+| 5 | What does the merchant side look like? | Promotions are paid to merchants. Their size and health decide the price. |
+| 6 | Where does discovery happen? | The new-merchant window is the only place in this export where a *new* commercial relationship is visible. That is what a promotion is trying to create. |
+
+Everything is measured, nothing is assumed, and every claim in the
+recommendation carries the statistic that produced it.
+
+---
+
+# Data assembly and what we found wrong with it
+
+Three files were handed over. Before any analysis, we audited them.
+
+```{r load}
+hist_raw  <- read_fast(file.path(DATA_DIR, "historical_transactions_100k.csv"))
+new_raw   <- read_fast(file.path(DATA_DIR, "new_merchant_transactions.csv"))
+merch_raw <- read_fast(file.path(DATA_DIR, "merchants1.csv"))
+
+data.frame(
+  File = c("historical_transactions_100k.csv", "new_merchant_transactions.csv", "merchants1.csv"),
+  `Rows as delivered` = c(nrow(hist_raw), nrow(new_raw), nrow(merch_raw)),
+  Columns = c(ncol(hist_raw), ncol(new_raw), ncol(merch_raw)),
+  check.names = FALSE) %>% kable(format.args = list(big.mark = ","))
+```
+
+## Three defects worth naming
+
+**One — the new-merchant file is 90% empty.** It arrives with 1,048,575 rows,
+which is exactly the Excel worksheet limit minus the header. Everything past
+row 100,000 is a row of commas. Any team that reported "1.05 million
+new-merchant transactions" to the Board would have been wrong by a factor of
+ten.
+
+```{r clean-new}
+filler <- sum(is.na(new_raw$card_id) | new_raw$card_id == "")
+new_raw <- new_raw[!is.na(new_raw$card_id) & new_raw$card_id != "", ]
+cat("Empty filler rows removed:", format(filler, big.mark = ","),
+    "\nReal new-merchant transactions:", format(nrow(new_raw), big.mark = ","))
+```
+
+**Two — the merchant reference file repeats itself.** 63 `merchant_id` values
+appear twice. Left alone they double-count in every supply-side share.
+
+**Three — the growth ratios contain literal infinities.** Three merchants had
+zero transactions in their base month, so `avg_purchases_lag*` divides by zero.
+
+```{r clean-merch}
+dup_merch <- sum(duplicated(merch_raw$merchant_id))
+merch <- merch_raw[!duplicated(merch_raw$merchant_id), ]
+
+lag_cols <- c("avg_sales_lag3", "avg_purchases_lag3", "avg_sales_lag6",
+              "avg_purchases_lag6", "avg_sales_lag12", "avg_purchases_lag12")
+for (cc in lag_cols) merch[[cc]] <- suppressWarnings(as.numeric(merch[[cc]]))
+for (cc in c("subsector_id", "state_id", "city_id", "merchant_category_id",
+             "numerical_1", "numerical_2", "category_2",
+             "active_months_lag3", "active_months_lag6", "active_months_lag12"))
+  merch[[cc]] <- suppressWarnings(as.numeric(merch[[cc]]))
+
+cat("Duplicate merchant rows dropped:", dup_merch,
+    "\nUnique merchants:", format(nrow(merch), big.mark = ","),
+    "\nNon-finite growth ratios:", sum(!is.finite(merch$avg_purchases_lag3)))
+```
+
+## A structural limit we have to be honest about
+
+The two transaction files were sampled independently. The historical ledger
+covers **463 cards** in depth; the new-merchant window covers **7,530 cards**
+shallowly; only **16 cards appear in both**.
+
+```{r overlap}
+cat("Cards in historical ledger :", n_distinct(hist_raw$card_id),
+    "\nCards in novelty window    :", n_distinct(new_raw$card_id),
+    "\nCards present in both      :",
+    length(intersect(unique(hist_raw$card_id), unique(new_raw$card_id))))
+```
+
+So we **cannot** ask "did card X change behaviour when it met a new merchant".
+We can — and do — ask the portfolio-level version: *how does spending at
+merchants a card already knows differ from spending at merchants it has never
+visited?* Every novelty finding in this document is a comparison of
+**two windows of the same network**, not a within-card before/after. Stated up
+front so no one over-reads it.
+
+The card-level file described in the data dictionary (`train.csv`, carrying
+`first_active_month` and the loyalty `target`) was not part of the export. We
+therefore rebuild tenure and value from observed behaviour rather than using
+the supplied loyalty score. Section 11 sets out what that costs us.
+
+---
+
+# Reading the money: de-normalising `purchase_amount`
+
+`purchase_amount` is a normalised quantity ranging from about −0.75 to
++11,270. Nobody can take that to a Board. It is, however, an **affine
+transform** of the real Brazilian Real amount, and an affine transform can be
+recovered.
+
+Two anchors do it. The floor of the distribution must correspond to the
+smallest possible real purchase, and the bulk of a retail ledger must land in
+sensible everyday money. Solving on that basis gives:
+
+$$\text{BRL} \;=\; \frac{\texttt{purchase\_amount}}{0.00150265} \;+\; 497.06$$
+
+```{r denorm}
+SCALE <- 0.00150265; OFFSET <- 497.06
+to_brl <- function(x) x / SCALE + OFFSET
+
+prep_txn <- function(df) {
+  num_cols <- c("purchase_amount", "installments", "month_lag", "city_id",
+                "state_id", "subsector_id", "merchant_category_id", "category_2")
+  for (cc in intersect(num_cols, names(df)))
+    df[[cc]] <- suppressWarnings(as.numeric(df[[cc]]))
+  df %>% mutate(
+    amount_brl   = to_brl(purchase_amount),
+    purchase_ts  = as.POSIXct(purchase_date, format = "%d-%m-%Y %H:%M", tz = "UTC"),
+    purchase_day = as.Date(purchase_ts),
+    month        = format(purchase_ts, "%Y-%m"),
+    hour         = as.integer(format(purchase_ts, "%H")),
+    instal       = ifelse(is.na(installments) | installments < 0, NA_real_,
+                          as.numeric(installments)),
+    instal_band  = cut(instal, c(-1, 0, 1, 3, 6, 12, 999),
+                       labels = c("0 (lump sum)", "1 (single)", "2-3", "4-6", "7-12", "13+")),
+    approved     = authorized_flag == "Y")
+}
+hist_txn <- prep_txn(hist_raw)
+new_txn  <- prep_txn(new_raw)
+
+round(quantile(hist_txn$amount_brl, c(0, .01, .25, .5, .75, .95, .99, 1)), 2) %>%
+  as.data.frame() %>% setNames("Amount (BRL)") %>% kable(format.args = list(big.mark = ","))
+```
+
+**The first validation is the distribution itself.** The minimum lands at
+R$0.01, the median at roughly **R$35**, the 75th percentile at **R$83** and the
+99th at about **R$1,031**. Not one transaction is negative. A wrong constant
+would have produced negative money at the bottom of the ledger, and it does
+not.
+
+## Trimming the tail
+
+99 records — one in a thousand — reach into the millions of Reais and are
+almost certainly settlement or reversal artefacts rather than shopping. One of
+them alone would move the portfolio average ticket by more than every finding
+in this report combined. We exclude the top 0.1% from all value statistics and
+say so wherever it matters.
+
+```{r trim}
+CAP    <- quantile(hist_txn$amount_brl, 0.999)
+hist_w <- hist_txn %>% filter(amount_brl <= CAP)
+new_w  <- new_txn  %>% filter(amount_brl <= quantile(amount_brl, 0.999))
+hist_ok <- hist_w %>% filter(approved)
+
+cat("Trim threshold:", comma(round(CAP)), "BRL | records excluded:",
+    sum(hist_txn$amount_brl > CAP),
+    "\nMean ticket before trim: R$", round(mean(hist_txn$amount_brl), 2),
+    " | after trim: R$", round(mean(hist_w$amount_brl), 2))
+```
+
+The average ticket falls from R$272 to **R$88** once 99 records are removed.
+That single line is the difference between telling the Board we are a
+mid-ticket network and telling them the truth.
+
+---
+
+# Testing the recovered currency: Benford's Law
+
+A transform we derived ourselves deserves an independent test, not a nod.
+**Benford's Law** says that in naturally occurring, multi-scale financial data
+the leading digit *d* appears with frequency $\log_{10}(1 + 1/d)$ — so about
+30% of amounts start with 1 and only 4.6% start with 9. It is the standard
+first screen in forensic accounting.
+
+The test is powerful here for a specific reason: **Benford conformity is not
+preserved under addition.** If our offset of 497.06 were wrong, the digit
+distribution would be dragged away from Benford. If the recovered amounts *do*
+conform, the transform is very unlikely to be badly wrong.
+
+```{r benford, fig.height=4.4}
+## First significant digit, computed arithmetically rather than by string
+## surgery: for x >= 1,  d = floor( x / 10^floor(log10 x) ).
+first_digit <- function(x) floor(x / 10^floor(log10(x)))
+
+bf <- hist_ok %>% filter(amount_brl >= 1) %>%
+  mutate(d = first_digit(amount_brl)) %>%
+  count(d) %>%
+  mutate(observed = n / sum(n),
+         benford  = log10(1 + 1 / d),
+         excess   = observed - benford)
+
+n_bf   <- sum(bf$n)
+exp_n  <- n_bf * bf$benford          # expected count per leading digit
+chi2   <- sum((bf$n - exp_n)^2 / exp_n)
+MAD    <- mean(abs(bf$excess))
+
+bf %>% transmute(`Leading digit` = d, Transactions = n,
+                 Observed = percent(observed, 0.01),
+                 `Benford` = percent(benford, 0.01),
+                 Deviation = percent(excess, 0.01)) %>%
+  kable(format.args = list(big.mark = ","))
+
+cat("n =", comma(n_bf),
+    "\nPearson chi-square (df = 8) :", round(chi2, 1),
+    "\nMean Absolute Deviation     :", round(MAD, 5))
+```
+
+```{r benford-chart, fig.height=4.2}
+bf %>% select(d, observed, benford) %>%
+  pivot_longer(-d, names_to = "series", values_to = "share") %>%
+  mutate(series = factor(series, levels = c("observed", "benford"),
+                         labels = c("Observed in the ledger", "Benford's Law"))) %>%
+  ggplot(aes(factor(d), share, fill = series)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = percent) +
+  scale_fill_manual(values = c(PAL[1], PAL[4]), name = NULL) +
+  labs(title = "The recovered Reais obey Benford's Law",
+       subtitle = "Leading-digit frequency of every approved transaction of R$1 or more",
+       x = "Leading digit", y = "Share of transactions",
+       caption = "A wrong additive constant would visibly distort this distribution. It does not.")
+```
+
+**How to read the two statistics, because they disagree and both are right.**
+The chi-square is large. With n = 92,714 that is expected and uninformative:
+chi-square scales with sample size, so at this volume it rejects conformity for
+any real-world dataset. The standard remedy in the forensic literature
+(Nigrini) is the **Mean Absolute Deviation**, which does not scale with n:
+
+| MAD | Interpretation |
+|-----|----------------|
+| ≤ 0.006 | Close conformity |
+| ≤ 0.012 | **Acceptable conformity** |
+| ≤ 0.015 | Marginal |
+| > 0.015 | Non-conformity |
+
+Our MAD is **0.0086 — acceptable conformity**. The currency recovery stands.
+
+## The one deviation is itself a finding
+
+Digit 9 is over-represented: 6.1% observed against 4.6% expected. That is not
+noise, and it is not an error in the transform. It is **psychological pricing**.
+
+```{r price-points}
+cents <- round((hist_ok$amount_brl %% 1) * 100)
+data.frame(Ending = c(".00", ".50", ".90", ".99"),
+           Share  = percent(c(mean(cents == 0), mean(cents == 50),
+                              mean(cents == 90), mean(cents == 99)), 0.01)) %>%
+  kable(caption = "Where the cents land")
+```
+
+**36.4% of all transactions end in exactly .00** and another 4.4% end in .90.
+Brazilian retail runs on R$9.90, R$19.90, R$29.90 price points — every one of
+which puts a 9 or a 1 in the leading position. The Benford deviation is the
+fingerprint of the country's pricing conventions showing through, which is
+about as strong a corroboration of the currency recovery as the data can offer.
+From here on, every currency figure in this report is real Reais.
+
+---
+
+# Who transacts on our cards?
+
+```{r card-profile}
+ref_date <- max(hist_ok$purchase_ts, na.rm = TRUE)
+ref_day  <- max(hist_ok$purchase_day, na.rm = TRUE)
+
+card <- hist_ok %>%
+  group_by(card_id) %>%
+  summarise(txns = n(), spend = sum(amount_brl), avg_ticket = mean(amount_brl),
+            merchants = n_distinct(merchant_id), subsectors = n_distinct(subsector_id),
+            first_seen = min(purchase_ts), last_seen = max(purchase_ts),
+            last_day = max(purchase_day), first_month = min(month), .groups = "drop") %>%
+  mutate(recency_days  = as.numeric(difftime(ref_date, last_seen, units = "days")),
+         days_since    = as.numeric(ref_day - last_day),
+         active_months = pmax(as.numeric(difftime(last_seen, first_seen, units = "days")) / 30.44, 1),
+         txns_pm  = txns  / active_months,
+         spend_pm = spend / active_months) %>%
+  left_join(hist_w %>% group_by(card_id) %>%
+              summarise(decline_rate = mean(!approved), .groups = "drop"), by = "card_id")
+
+card %>% summarise(
+  Cards = n(),
+  `Median transactions` = median(txns),
+  `Median spend (BRL)` = round(median(spend)),
+  `Median ticket (BRL)` = round(median(avg_ticket), 2),
+  `Median distinct merchants` = median(merchants),
+  `Median decline rate` = percent(median(decline_rate), 0.1)) %>%
+  t() %>% kable(col.names = "Value")
+```
+
+## Putting a number on the concentration
+
+"The top fifth carries most of it" is an impression. **Gini** and the
+**Herfindahl–Hirschman Index** turn it into something a Board can compare
+across quarters. We bootstrap the Gini so the figure carries an interval
+rather than a decimal point.
+
+```{r gini}
+gini <- function(x) {
+  x <- sort(x[!is.na(x)]); n <- length(x)
+  sum((2 * seq_len(n) - n - 1) * x) / (n * sum(x))
+}
+hhi <- function(counts) { s <- counts / sum(counts); sum(s^2) * 10000 }
+
+merch_counts <- hist_ok %>% filter(!is.na(merchant_id)) %>% count(merchant_id) %>% pull(n)
+sub_counts   <- hist_ok %>% count(subsector_id) %>% pull(n)
+
+g_card <- gini(card$spend)
+boot_g <- replicate(2000, gini(sample(card$spend, nrow(card), replace = TRUE)))
+ci     <- quantile(boot_g, c(0.025, 0.975))
+
+data.frame(
+  Measure = c("Gini, card spend", "Gini, merchant transactions",
+              "HHI, merchants (0-10,000)", "Effective number of merchants",
+              "HHI, subsectors (0-10,000)", "Effective number of subsectors"),
+  Value = c(sprintf("%.3f  (95%% CI %.3f - %.3f)", g_card, ci[1], ci[2]),
+            sprintf("%.3f", gini(merch_counts)),
+            sprintf("%.1f", hhi(merch_counts)),
+            sprintf("%.0f", 10000 / hhi(merch_counts)),
+            sprintf("%.1f", hhi(sub_counts)),
+            sprintf("%.1f", 10000 / hhi(sub_counts)))) %>% kable()
+```
+
+A card-spend Gini of **0.54** is inequality on the scale of a national income
+distribution. The HHI numbers say something sharper still: although 20,549
+merchants transacted, the network **behaves like roughly 440 merchants and
+9 subsectors**. That is the effective size of the marketplace a promotions
+programme is actually operating in — and it is small enough to manage
+deliberately rather than by category rules of thumb.
+
+```{r pareto, fig.height=4.4}
+card_sorted <- card %>% arrange(desc(spend)) %>%
+  mutate(rank = row_number(), cum_share = cumsum(spend) / sum(spend),
+         card_share = rank / n())
+
+data.frame(`Top share of cards` = percent(c(.05, .10, .20, .50)),
+           `Share of total spend` = percent(
+             sapply(c(.05, .10, .20, .50),
+                    function(p) card_sorted$cum_share[ceiling(p * nrow(card_sorted))]), 0.1),
+           check.names = FALSE) %>% kable()
+
+ggplot(card_sorted, aes(card_share, cum_share)) +
+  geom_area(fill = PAL[3], alpha = .5) +
+  geom_line(colour = PAL[1], size = 1) +
+  geom_abline(linetype = "dashed", colour = "grey60") +
+  geom_vline(xintercept = .2, linetype = "dotted", colour = PAL[5]) +
+  annotate("text", x = .24, y = .35, hjust = 0, size = 3.4, colour = PAL[5],
+           label = "Top 20% of cards\ncarry 58% of spend") +
+  scale_x_continuous(labels = percent) + scale_y_continuous(labels = percent) +
+  labs(title = "Spend is owned by a fifth of the portfolio",
+       subtitle = sprintf("Lorenz curve of card spend. Gini = %.3f", g_card),
+       x = "Share of cards", y = "Share of spend",
+       caption = "Historical ledger, approved transactions, top 0.1% of tickets excluded")
+```
+
+The top 20% of cards carry **58%** of spend; the bottom half carry **14%**.
+The commercial reading is blunt: a promotions programme run as a broadcast is
+spending most of its budget on cardholders who contribute almost nothing, and
+is under-serving the group that funds the network.
+
+## Four cardholders, not one
+
+We segment on the two dimensions that a promotions team can actually act on —
+**value per active month** and **merchant breadth** (how many different
+merchants a card touches). Both are split at the portfolio median, which keeps
+the rule transparent and reproducible.
+
+```{r segments, fig.height=4.4}
+card <- card %>%
+  mutate(segment = case_when(
+    spend_pm >= median(spend_pm) & merchants >= median(merchants) ~ "Core Everyday",
+    spend_pm >= median(spend_pm)                                   ~ "Big-Ticket Narrow",
+    merchants >= median(merchants)                                 ~ "Explorer Light",
+    TRUE                                                           ~ "Occasional"),
+    segment = factor(segment, levels = c("Core Everyday", "Big-Ticket Narrow",
+                                         "Explorer Light", "Occasional")))
+
+seg_profile <- card %>% group_by(segment) %>%
+  summarise(Cards = n(),
+            `% of cards` = n() / nrow(card),
+            `% of spend` = sum(spend) / sum(card$spend),
+            `Spend / month` = mean(spend_pm),
+            `Txns / month` = mean(txns_pm),
+            `Avg ticket` = mean(avg_ticket),
+            `Merchants` = mean(merchants),
+            `Days since last txn` = mean(recency_days),
+            `Decline rate` = mean(decline_rate), .groups = "drop")
+
+seg_profile %>%
+  mutate(`% of cards` = percent(`% of cards`, 0.1),
+         `% of spend` = percent(`% of spend`, 0.1),
+         `Decline rate` = percent(`Decline rate`, 0.1),
+         across(where(is.numeric), ~round(.x, 1))) %>% kable()
+
+seg_profile %>% select(segment, `% of cards`, `% of spend`) %>%
+  pivot_longer(-segment) %>%
+  ggplot(aes(segment, value, fill = name)) +
+  geom_col(position = "dodge") +
+  geom_text(aes(label = percent(value, 0.1)), position = position_dodge(.9),
+            vjust = -0.4, size = 3.2) +
+  scale_y_continuous(labels = percent, expand = expansion(mult = c(0, .15))) +
+  scale_fill_manual(values = c(PAL[3], PAL[1]), name = NULL) +
+  labs(title = "One segment is the network",
+       subtitle = "Core Everyday cardholders are a third of the base and roughly three quarters of the money",
+       x = NULL, y = NULL)
+```
+
+Read across the table rather than down it:
+
+- **Core Everyday** — a third of cards, about **72% of spend**, 35 transactions
+  a month across ~115 different merchants, and the *lowest* decline rate. This
+  is the card in someone's pocket every day.
+- **Big-Ticket Narrow** — high value, but concentrated in ~40 merchants and
+  last seen ~43 days ago. High revenue, thin relationship: the segment most
+  exposed to a competitor's offer.
+- **Occasional** — a third of cards, under 9% of spend, and the **highest
+  decline rate** of the four. A broadcast promotion spends a third of its
+  budget here.
+- **Explorer Light** — broad but cheap: a R$41 ticket across 74 merchants.
+  Curious, low-value, and the natural audience for discovery offers.
+
+```{r kmeans}
+km <- kmeans(scale(card %>% transmute(log1p(spend_pm), log1p(txns_pm),
+                                      log1p(merchants), log1p(avg_ticket))),
+             centers = 4, nstart = 25)
+cat("Unsupervised cross-check - k-means (k = 4) cluster sizes:",
+    paste(km$size, collapse = " / "),
+    "\nBetween-cluster variance explained:", percent(km$betweenss / km$totss, 0.1))
+```
+
+An unsupervised k-means on the same behavioural variables separates the base
+into groups of comparable size and explains a large share of the variance, so
+the four-way split is a property of the data rather than an artefact of where
+we drew the median.
+
+---
+
+# Are we keeping the cards we activate?
+
+Volume grew over the window. Growth can come from two places — more cards, or
+more from each card — and the two call for completely different Q4 spending.
+A **cohort retention curve** separates them.
+
+```{r cohorts, fig.height=4.4}
+mnum <- function(s) 12L * as.integer(substr(s, 1, 4)) + as.integer(substr(s, 6, 7))
+last_m <- mnum(max(hist_ok$month))
+
+cohort_of <- card %>% transmute(card_id, coh = mnum(first_month))
+## Cards already transacting in the first observed month are left-censored -
+## they were not activated then, we simply started watching. Excluded.
+valid_coh <- sort(unique(cohort_of$coh)); valid_coh <- valid_coh[valid_coh > min(valid_coh)]
+coh_size  <- cohort_of %>% filter(coh %in% valid_coh) %>% count(coh, name = "cohort_n")
+
+active <- hist_ok %>%
+  inner_join(cohort_of, by = "card_id") %>%
+  filter(coh %in% valid_coh) %>%
+  mutate(age = mnum(month) - coh) %>%
+  distinct(card_id, coh, age)
+
+## Denominator at each age counts only cohorts old enough to have reached it.
+retention <- lapply(0:12, function(a) {
+  elig <- coh_size %>% filter(coh + a <= last_m)
+  n_elig <- sum(elig$cohort_n)
+  n_act  <- active %>% filter(age == a, coh %in% elig$coh) %>% nrow()
+  data.frame(age = a, eligible = n_elig, active = n_act,
+             retention = ifelse(n_elig > 0, n_act / n_elig, NA_real_))
+}) %>% bind_rows() %>% filter(eligible > 0)
+
+cat("Cohorts used (genuine activations after the first observed month):",
+    nrow(coh_size), "| cards:", sum(coh_size$cohort_n))
+
+retention %>% mutate(retention = percent(retention, 0.1)) %>%
+  kable(col.names = c("Months since first transaction", "Cards eligible",
+                      "Cards active", "Retention"))
+
+ggplot(retention, aes(age, retention)) +
+  geom_line(colour = PAL[1], size = 1) +
+  geom_point(colour = PAL[1], size = 2) +
+  geom_hline(yintercept = 1, linetype = "dotted", colour = "grey60") +
+  scale_y_continuous(labels = percent, limits = c(0, 1.02)) +
+  scale_x_continuous(breaks = 0:12) +
+  labs(title = "Cards that activate, stay",
+       subtitle = "Share of an activation cohort still transacting, by months since first purchase",
+       x = "Months since first transaction", y = "Still active",
+       caption = "Cohorts activating after the first observed month only; denominator counts cohorts with that much exposure.")
+```
+
+Retention is **95% at one month and still above 70% at twelve**. For a card
+portfolio that is very sticky, and it settles the growth question: the network
+is not leaking cards. Volume rose because **more cards were activated**, while
+transactions per active card barely moved. The promotions programme, whose job
+is the second thing, is not visible in this series — which is precisely the
+gap this analysis is trying to close.
+
+## Which cards are quietly going cold
+
+Recency alone is a blunt instrument: a card that normally transacts weekly and
+a card that normally transacts monthly are not equally worrying at 30 days
+silent. So we score each card **against its own rhythm**.
+
+```{r lapse}
+day_gaps <- hist_ok %>%
+  distinct(card_id, purchase_day) %>%
+  arrange(card_id, purchase_day) %>%
+  group_by(card_id) %>%
+  mutate(gap = as.numeric(purchase_day - lag(purchase_day))) %>%
+  summarise(median_gap = median(gap, na.rm = TRUE),
+            active_days = n(), .groups = "drop")
+
+lapse <- card %>%
+  left_join(day_gaps, by = "card_id") %>%
+  filter(!is.na(median_gap), active_days >= 3) %>%
+  mutate(lapse_index = days_since / pmax(median_gap, 1))
+
+data.frame(
+  Threshold = c("lapse index > 3", "lapse index > 5", "lapse index > 8"),
+  Cards = sapply(c(3, 5, 8), function(t) sum(lapse$lapse_index > t)),
+  `% of scored cards` = percent(sapply(c(3, 5, 8),
+                         function(t) mean(lapse$lapse_index > t)), 0.1),
+  `Share of spend` = percent(sapply(c(3, 5, 8),
+                      function(t) sum(lapse$spend[lapse$lapse_index > t]) / sum(lapse$spend)), 0.1),
+  `Spend at risk (BRL)` = comma(round(sapply(c(3, 5, 8),
+                           function(t) sum(lapse$spend[lapse$lapse_index > t])))),
+  check.names = FALSE) %>% kable()
+
+cat("Median gap between active days:", median(lapse$median_gap), "days",
+    "\nMedian days since last transaction:", median(lapse$days_since))
+```
+
+The **lapse index** is days-since-last-transaction divided by that card's own
+median gap between active days. A value of 1 means the card is exactly on
+schedule; a value of 8 means it has been silent eight times longer than it has
+ever normally gone.
+
+**191 cards — 41% of the scored base — are past three times their own rhythm,
+and they hold 31% of portfolio spend.** That is a reactivation list with a
+name attached to every row, and it is a far better mailing list than "everyone
+who has not transacted in 30 days", because it automatically excludes the
+monthly shopper who is behaving perfectly normally.
+
+---
+
+# How is the network actually used?
+
+## This is the identity answer
+
+```{r instalments, fig.height=4.2}
+instal_mix <- hist_w %>% filter(!is.na(instal_band)) %>%
+  count(instal_band) %>% mutate(share = n / sum(n))
+
+instal_mix %>% mutate(share = percent(share, 0.1)) %>%
+  kable(col.names = c("Instalments", "Transactions", "Share"),
+        format.args = list(big.mark = ","))
+
+ggplot(instal_mix, aes(instal_band, share)) +
+  geom_col(fill = PAL[1]) +
+  geom_text(aes(label = percent(share, 0.1)), vjust = -0.4, size = 3.6) +
+  scale_y_continuous(labels = percent, expand = expansion(mult = c(0, .15))) +
+  labs(title = "Elo is not an instalment network",
+       subtitle = "96% of transactions settle in a single payment - the parcelado market is happening somewhere else",
+       x = "Instalments on the transaction", y = "Share of transactions")
+```
+
+In Brazil, *parcelado* — splitting a purchase across monthly instalments — is
+the defining behaviour of the card market. On this ledger it is almost absent.
+**56%** of transactions are lump sum, **40%** are a single payment, and
+everything from two instalments upward accounts for under **4%**.
+
+Combined with a median ticket of **R$35**, **63%** of transactions under R$50
+and 36% of amounts landing on a round Real, the identity is settled:
+
+> **Elo is a high-frequency, small-ticket, everyday-spend network.** It is the
+> card people use for lunch, fuel, groceries and pharmacy — not the card they
+> use to finance a television.
+
+That single sentence should govern the Q4 promotions strategy, because
+everything a promotions team is tempted to do — big-ticket instalment offers,
+electronics tie-ups, luxury partnerships — is aimed at a network we are not.
+
+```{r time-patterns, fig.height=3.8}
+hist_ok %>% count(hour) %>% mutate(share = n / sum(n)) %>%
+  ggplot(aes(hour, share)) +
+  geom_col(fill = PAL[2]) +
+  scale_y_continuous(labels = percent) + scale_x_continuous(breaks = seq(0, 23, 3)) +
+  labs(title = "A daytime, everyday rhythm",
+       subtitle = "Share of approved transactions by hour - a lunchtime peak, then a long afternoon plateau",
+       x = "Hour of day", y = NULL)
+```
+
+The clock agrees with the ticket. Volume builds from 10am, peaks at lunch
+(1pm), holds through the afternoon and falls away after 9pm. This is
+consumption, not commerce.
+
+## Authorisation: a small leak in a specific place
+
+```{r approval}
+approval_overall <- mean(hist_txn$approved)
+
+ticket_band <- hist_w %>%
+  mutate(band = cut(amount_brl, c(0, 25, 50, 100, 250, 500, 1000, Inf),
+                    labels = c("<25", "25-50", "50-100", "100-250", "250-500", "500-1k", "1k+"))) %>%
+  group_by(band) %>%
+  summarise(Transactions = n(), `% of volume` = n() / nrow(hist_w),
+            `Decline rate` = mean(!approved), .groups = "drop")
+
+cat("Overall approval rate:", percent(approval_overall, 0.01))
+ticket_band %>% mutate(`% of volume` = percent(`% of volume`, 0.1),
+                       `Decline rate` = percent(`Decline rate`, 0.1)) %>%
+  kable(format.args = list(big.mark = ","))
+```
+
+```{r decline-chart, fig.height=4.2}
+ggplot(ticket_band, aes(band, `Decline rate`)) +
+  geom_col(fill = PAL[5]) +
+  geom_text(aes(label = percent(`Decline rate`, 0.1)), vjust = -0.4, size = 3.5) +
+  scale_y_continuous(labels = percent, expand = expansion(mult = c(0, .18))) +
+  labs(title = "Declines climb steeply with basket size",
+       subtitle = "A 6.7% decline rate under R$25 becomes 18.7% above R$1,000",
+       x = "Ticket size (BRL)", y = "Declined share")
+```
+
+Approval is **93.0%** overall, which sounds healthy. It is not evenly
+distributed. Below R$25 we decline 6.7% of attempts; above R$1,000 we decline
+**18.7%**. The network is at its *worst* exactly where a promotion would be
+trying to push a cardholder to trade up.
+
+## What actually causes a decline?
+
+```{r logit}
+ct_df <- hist_w %>% filter(!is.na(instal_band)) %>% mutate(instal_band = droplevels(instal_band))
+chi <- chisq.test(table(ct_df$instal_band, ct_df$approved))
+cat("Chi-square, instalment band x authorisation:  X-squared =", round(chi$statistic, 1),
+    " df =", chi$parameter, " p =", format.pval(chi$p.value, digits = 3))
+
+mdl <- hist_w %>% filter(!is.na(instal)) %>%
+  transmute(decline = as.integer(!approved),
+            log_amt = log1p(pmax(amount_brl, 0.01)),
+            multi   = as.integer(instal >= 2),
+            cat1_y  = as.integer(category_1 == "Y"))
+fit <- glm(decline ~ log_amt + multi + cat1_y, data = mdl, family = binomial())
+or_ci <- suppressMessages(exp(confint.default(fit)))
+
+data.frame(Term = c("(Intercept)", "log(amount)", "2+ instalments", "category_1 = Y"),
+           Coefficient = round(coef(fit), 4),
+           `Odds ratio` = round(exp(coef(fit)), 3),
+           `95% CI` = sprintf("%.2f - %.2f", or_ci[, 1], or_ci[, 2]),
+           `z value` = round(summary(fit)$coefficients[, 3], 1),
+           check.names = FALSE, row.names = NULL) %>% kable()
+
+cat("McFadden pseudo R-squared:", round(1 - fit$deviance / fit$null.deviance, 4),
+    "| n =", comma(nrow(mdl)))
+```
+
+The association between instalments and authorisation is real and not a fluke
+of sample size. But the logistic model says something more useful: the
+dominant driver is not the amount and not the instalment plan — it is the
+anonymised flag **`category_1 = Y`, which multiplies the odds of a decline by
+roughly 4.3×**, with a confidence interval nowhere near 1. Only 6.1% of
+transactions carry that flag, and they are being turned away at more than four
+times the normal rate.
+
+**Business consequence.** Before Elo spends a cent on Q4 promotions, the risk
+team should be asked what `category_1 = Y` represents. If it is a merchant
+risk classification, we are currently promoting into a population we then
+decline. That is a promotion budget that generates a bad cardholder experience
+and no revenue.
+
+```{r monthly, fig.height=4.4}
+monthly <- hist_ok %>% group_by(month) %>%
+  summarise(Transactions = n(), Spend = sum(amount_brl),
+            `Active cards` = n_distinct(card_id),
+            `Avg ticket` = mean(amount_brl), .groups = "drop") %>%
+  mutate(`Txns per active card` = round(Transactions / `Active cards`, 1))
+
+monthly %>% mutate(Spend = comma(round(Spend)), `Avg ticket` = round(`Avg ticket`, 2)) %>%
+  kable(format.args = list(big.mark = ","))
+
+ggplot(monthly, aes(month, Transactions, group = 1)) +
+  geom_line(colour = PAL[1], size = 1) + geom_point(colour = PAL[1]) +
+  geom_line(aes(y = `Active cards` * 20), colour = PAL[4], linetype = "dashed", size = .9) +
+  scale_y_continuous(labels = comma,
+                     sec.axis = sec_axis(~ . / 20, name = "Active cards (dashed)")) +
+  labs(title = "Volume grows because cards activate, not because cards spend more",
+       subtitle = "Approved transactions (solid, left) against active cards (dashed, right)",
+       x = NULL, y = "Transactions") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Transactions roughly double over the window, but transactions *per active
+card* barely move — 18 in January 2017, 20 in February 2018, with a December
+peak of 25. Average ticket rises from R$81 to R$98 in December and falls back.
+Read together with the retention curve above, the diagnosis is clean: **the
+network grows by adding cards, not by getting existing cards to do more.**
+
+---
+
+# The merchant side of the marketplace
+
+## A base of very small merchants
+
+```{r pyramid}
+size_pyramid <- merch %>% filter(!is.na(most_recent_sales_range)) %>%
+  count(most_recent_sales_range) %>% mutate(share = n / sum(n))
+
+size_pyramid %>% mutate(share = percent(share, 0.1)) %>%
+  kable(col.names = c("Sales range (A = largest)", "Merchants", "Share of base"),
+        format.args = list(big.mark = ","))
+```
+
+**88%** of the merchant base sits in the two smallest revenue bands. Only
+**1,005 merchants — 0.3% — are in the top band.** Elo's marketplace is a long
+tail of very small businesses with a handful of large ones at the top.
+
+## And a ledger that only touches a fraction of it
+
+```{r concentration}
+## 0.5% of ledger rows carry no merchant_id. They are dropped from every
+## merchant-level count, otherwise "unknown" ranks as the largest merchant.
+hist_m <- hist_ok %>% filter(!is.na(merchant_id))
+new_m  <- new_w   %>% filter(!is.na(merchant_id))
+
+merch_txn <- hist_m %>% count(merchant_id, name = "txns") %>%
+  arrange(desc(txns)) %>% mutate(cum_share = cumsum(txns) / sum(txns))
+seen <- union(unique(hist_m$merchant_id), unique(new_m$merchant_id))
+
+data.frame(Metric = c("Merchants in the reference file",
+                      "Merchants transacted with in the historical window",
+                      "Merchants transacted with in the novelty window",
+                      "Merchants never seen in either window",
+                      "Share of transactions from the top 100 merchants",
+                      "Share of transactions from the top 1,000 merchants"),
+           Value = c(comma(nrow(merch)), comma(nrow(merch_txn)),
+                     comma(n_distinct(new_m$merchant_id)),
+                     percent(1 - length(seen) / nrow(merch), 0.1),
+                     percent(merch_txn$cum_share[100], 0.1),
+                     percent(merch_txn$cum_share[1000], 0.1))) %>% kable()
+```
+
+Two facts sit awkwardly together. **82% of the merchants we maintain reference
+data for never appear in either transaction window**, while the **top 1,000
+merchants carry half of all transactions**. The merchant file is largely an
+archive; the live marketplace is far smaller and far more concentrated than
+the file implies — which is exactly what the HHI of 22.6, an effective 440
+merchants, was telling us in Section 5.
+
+## Health of the supply base
+
+```{r health}
+merch_seg <- merch %>%
+  filter(is.finite(avg_purchases_lag3), is.finite(avg_purchases_lag12),
+         avg_purchases_lag12 != 0) %>%
+  mutate(momentum = avg_purchases_lag3 / avg_purchases_lag12,
+         health = case_when(active_months_lag12 < 12 ~ "Intermittent",
+                            momentum >= 1.05 ~ "Accelerating",
+                            momentum <= 0.95 ~ "Decelerating",
+                            TRUE ~ "Steady"))
+
+merch_seg %>% count(health) %>% mutate(Share = percent(n / sum(n), 0.1)) %>%
+  arrange(desc(n)) %>% kable(col.names = c("Health", "Merchants", "Share"),
+                             format.args = list(big.mark = ","))
+```
+
+Comparing each merchant's last-three-month transaction ratio with its
+last-twelve-month ratio splits the base into four states. **39% are
+decelerating** and a further **9% transact intermittently** — nearly half the
+marketplace is flat or shrinking. Only 27% are accelerating. A promotions
+programme has a genuine supply-side job here, but only if it is aimed at
+merchants that can convert traffic, not at ones already on the way out.
+
+## Where the money actually lands
+
+```{r tiers, fig.height=4.6}
+tier <- merch %>% select(merchant_id, most_recent_sales_range)
+tier_flow <- bind_rows(
+  hist_m %>% select(merchant_id) %>% mutate(window = "Incumbent spend"),
+  new_m   %>% select(merchant_id) %>% mutate(window = "New-merchant spend")) %>%
+  left_join(tier, by = "merchant_id") %>%
+  filter(!is.na(most_recent_sales_range)) %>%
+  count(window, most_recent_sales_range) %>%
+  group_by(window) %>% mutate(share = n / sum(n)) %>% ungroup() %>%
+  bind_rows(size_pyramid %>% transmute(window = "Merchant population",
+                                       most_recent_sales_range, n, share))
+
+tier_flow %>% select(-n) %>%
+  pivot_wider(names_from = window, values_from = share) %>%
+  mutate(across(where(is.numeric), ~percent(.x, 0.1))) %>%
+  kable(col.names = c("Tier", "Incumbent spend", "New-merchant spend", "Merchant population"))
+
+ggplot(tier_flow, aes(most_recent_sales_range, share,
+                      fill = factor(window, levels = c("Merchant population",
+                                                       "Incumbent spend", "New-merchant spend")))) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = percent) +
+  scale_fill_manual(values = PAL[c(6, 1, 4)], name = NULL) +
+  labs(title = "Incumbency sits at the top of the pyramid, discovery in the tail",
+       subtitle = "Tier A is 0.3% of merchants and 26% of incumbent volume - but only 17% of new-merchant volume",
+       x = "Merchant size tier (A = largest)", y = "Share")
+```
+
+This is the most commercially loaded chart in the report.
+
+- Tier A is **0.3% of merchants** but takes **26.1%** of incumbent
+  transactions. These are the merchants a cardholder already uses.
+- In the novelty window that same tier takes only **16.9%**, while tier D
+  rises from 19.1% to **26.8%**.
+
+**New commercial relationships form disproportionately in the long tail.**
+A promotion placed with a tier A merchant is, on this evidence, largely paying
+for traffic that was going to happen anyway. A promotion placed with a healthy
+tier C or D merchant is far more likely to be paying for a relationship that
+did not previously exist.
+
+---
+
+# Region: where supply does not match demand
+
+```{r geo, fig.height=5}
+geo <- full_join(hist_ok %>% count(state_id, name = "inc_txns"),
+                 new_w   %>% count(state_id, name = "nov_txns"), by = "state_id") %>%
+  full_join(merch %>% count(state_id, name = "merchants"), by = "state_id") %>%
+  replace_na(list(inc_txns = 0, nov_txns = 0, merchants = 0)) %>%
+  mutate(`Demand share`   = inc_txns / sum(inc_txns),
+         `Novelty share`  = nov_txns / sum(nov_txns),
+         `Supply share`   = merchants / sum(merchants),
+         `Coverage index` = `Supply share` / `Demand share`,
+         `Novelty index`  = `Novelty share` / `Demand share`) %>%
+  arrange(desc(inc_txns))
+
+geo %>% head(10) %>%
+  mutate(across(c(`Demand share`, `Novelty share`, `Supply share`), ~percent(.x, 0.1)),
+         across(c(`Coverage index`, `Novelty index`), ~round(.x, 2))) %>%
+  select(state_id, inc_txns, `Demand share`, `Supply share`, `Coverage index`,
+         `Novelty share`, `Novelty index`) %>%
+  kable(col.names = c("State", "Transactions", "Demand share", "Supply share",
+                      "Coverage", "Novelty share", "Novelty index"),
+        format.args = list(big.mark = ","))
+
+geo %>% filter(inc_txns >= 500) %>%
+  ggplot(aes(`Demand share`, `Supply share`)) +
+  geom_abline(linetype = "dashed", colour = "grey60") +
+  geom_point(aes(size = inc_txns), colour = PAL[1], alpha = .75) +
+  geom_text(aes(label = paste0("S", state_id)), vjust = -1.1, size = 3, colour = "grey30") +
+  scale_x_continuous(labels = percent) + scale_y_continuous(labels = percent) +
+  scale_size_continuous(range = c(2, 10), guide = "none") +
+  labs(title = "Where the merchant base does not match the cardholders",
+       subtitle = "Below the dashed line = more cardholder demand than merchant supply",
+       x = "Share of card transactions", y = "Share of merchants",
+       caption = "States with at least 500 transactions in the historical window. S-1 = unknown/unmapped state code.")
+```
+
+State 9 alone is **39% of card demand** but only **28% of the merchant base**
+— a coverage index of 0.71, the largest under-served market in the network.
+States 15, 19 and 16 carry more merchants than their share of demand.
+
+The more interesting column is the **novelty index**. State 22 has only 3.1%
+of demand but a novelty index of **1.31** — its cardholders try new merchants
+far more readily than the network average, on a merchant base that is
+proportionally thin. That combination is a merchant-acquisition target, not a
+discount target.
+
+---
+
+# The novelty window: what discovery actually looks like
+
+This is the file most teams ignore, and it is the only place in the export
+where a *new* commercial relationship is visible. A promotion that works
+creates exactly this event.
+
+```{r novelty}
+data.frame(
+  Metric = c("Transactions", "Cards", "Distinct merchants",
+             "New merchants tried per card (2 months)",
+             "Average ticket at a new merchant (BRL)",
+             "Average ticket at a known merchant (BRL)",
+             "Median ticket at a new merchant (BRL)",
+             "Median ticket at a known merchant (BRL)"),
+  Value = c(comma(nrow(new_w)), comma(n_distinct(new_w$card_id)),
+            comma(n_distinct(new_m$merchant_id)),
+            round(mean(tapply(new_m$merchant_id, new_m$card_id,
+                              function(x) length(unique(x)))), 1),
+            round(mean(new_w$amount_brl), 2), round(mean(hist_ok$amount_brl), 2),
+            round(median(new_w$amount_brl), 2), round(median(hist_ok$amount_brl), 2))) %>%
+  kable()
+```
+
+```{r novelty-test}
+## Is the first-visit ticket premium real, or sampling noise? Welch's t-test on
+## the log scale, because the amount distribution is heavily right-skewed.
+tt <- t.test(log(new_w$amount_brl[new_w$amount_brl > 0]),
+             log(hist_ok$amount_brl[hist_ok$amount_brl > 0]))
+cat("Welch t-test on log(amount), new merchant vs known merchant",
+    "\n  t =", round(tt$statistic, 1), " df =", round(tt$parameter),
+    " p =", format.pval(tt$p.value, digits = 3),
+    "\n  ratio of geometric means:", round(exp(diff(rev(tt$estimate))), 3))
+```
+
+```{r novelty-instal, fig.height=4.2}
+novelty_instal <- bind_rows(
+  hist_ok %>% filter(!is.na(instal_band)) %>% count(instal_band) %>%
+    mutate(Window = "At a known merchant", share = n / sum(n)),
+  new_w %>% filter(!is.na(instal_band)) %>% count(instal_band) %>%
+    mutate(Window = "At a new merchant", share = n / sum(n)))
+
+ggplot(novelty_instal, aes(instal_band, share, fill = Window)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = percent) +
+  scale_fill_manual(values = PAL[c(4, 1)], name = NULL) +
+  labs(title = "Trying somewhere new is a considered purchase",
+       subtitle = "A first visit carries a bigger ticket and is more likely to be split into instalments",
+       x = "Instalments", y = "Share of transactions")
+```
+
+Three findings, each one actionable:
+
+1. **A first visit costs 40% more.** R$118.70 at a new merchant against
+   R$84.70 at a known one, and the Welch test on log amounts puts that
+   difference far beyond sampling noise. Discovery is not impulse — it is a
+   considered purchase, and it is worth more per transaction.
+2. **Instalment use nearly doubles.** 2–3 instalment purchases run at 4.2% at
+   new merchants against 2.5% at known ones. The one place where Elo's
+   cardholders do reach for instalments is a first purchase somewhere new.
+   That is where an instalment-linked promotion would land, and nowhere else.
+3. **Cardholders try roughly 13 new merchants in two months.** Appetite for
+   discovery is not the constraint. Direction is.
+
+---
+
+# The Q4 targeting engine
+
+Everything above now converges. We build the targeting decision from three
+measurements per merchant subsector, each one observed rather than assumed.
+
+| Measure | Definition | What it answers |
+|---------|------------|-----------------|
+| **Novelty Capture Index (NCI)** | share of new-merchant volume ÷ share of incumbent volume | Do cardholders come here to try something *new*? |
+| **Card reach** | share of cards with at least one transaction in the subsector | Do our cardholders already *know* this category? |
+| **Discovery yield** | new-merchant transactions per 1,000 incumbent transactions | How much first-visit activity does exposure here actually produce? |
+
+```{r targeting}
+n_cards_total <- n_distinct(hist_ok$card_id)
+Ni <- nrow(hist_ok); Nn <- nrow(new_w)
+
+sub_map <- hist_ok %>%
+  group_by(subsector_id) %>%
+  summarise(inc_txns   = n(),
+            reach      = n_distinct(card_id) / n_cards_total,
+            avg_ticket = mean(amount_brl), .groups = "drop") %>%
+  full_join(new_w %>% count(subsector_id, name = "nov_txns"), by = "subsector_id") %>%
+  full_join(merch %>% count(subsector_id, name = "merchants"), by = "subsector_id") %>%
+  replace_na(list(inc_txns = 0, nov_txns = 0, merchants = 0, reach = 0)) %>%
+  mutate(demand_share  = inc_txns / Ni,
+         novelty_share = nov_txns / Nn,
+         supply_share  = merchants / sum(merchants),
+         NCI = novelty_share / demand_share,
+         COV = supply_share  / demand_share,
+         yield_1000 = nov_txns / inc_txns * 1000) %>%
+  filter(inc_txns >= 300)
+
+## Delta-method 95% interval for the NCI. The index is a ratio of two
+## independent binomial proportions, so its log has a closed-form variance -
+## faster and tighter than a bootstrap, and it lets us say which subsectors are
+## *significantly* discovery categories rather than merely ranking them.
+p_i <- sub_map$inc_txns / Ni
+p_n <- sub_map$nov_txns / Nn
+se  <- sqrt((1 - p_n) / (Nn * p_n) + (1 - p_i) / (Ni * p_i))
+
+sub_map <- sub_map %>%
+  mutate(NCI_lo = exp(log(NCI) - 1.96 * se),
+         NCI_hi = exp(log(NCI) + 1.96 * se),
+         verdict = case_when(NCI_lo > 1.2 ~ "Discovery",
+                             NCI_hi < 1.2 ~ "Habit",
+                             TRUE         ~ "Not distinguishable"),
+         Play = case_when(
+           verdict == "Discovery" & reach >= 0.60 ~ "Merchant discovery",
+           verdict == "Discovery" & reach <  0.60 ~ "Category expansion",
+           verdict == "Habit"     & reach >= 0.60 ~ "Habit channel",
+           TRUE                                    ~ "Deprioritise")) %>%
+  arrange(desc(demand_share))
+
+sub_map %>%
+  transmute(Subsector = subsector_id, Transactions = inc_txns,
+            `Volume %` = percent(demand_share, 0.1),
+            Reach = percent(reach, 0.1),
+            NCI = round(NCI, 2),
+            `NCI 95% CI` = sprintf("%.2f - %.2f", NCI_lo, NCI_hi),
+            Verdict = verdict,
+            `Yield /1000` = round(yield_1000),
+            `Ticket` = round(avg_ticket),
+            Play) %>%
+  kable(format.args = list(big.mark = ","))
+```
+
+**Why the confidence interval matters.** On point estimates alone, subsectors
+21 (NCI 1.26) and 39 (1.20) look like discovery categories. Their intervals
+straddle the 1.2 threshold, so they are **not distinguishable** from the
+network average and do not earn budget. Eleven subsectors clear the bar with
+the whole interval above it — including subsector 27 at **2.16 (2.09–2.24)**
+and, at the other end, subsector 33 sitting at **0.42 (0.41–0.43)**, which is
+about as unambiguous as data gets.
+
+## Four plays, not one budget
+
+```{r play-map, fig.height=5.4}
+pal_play <- c("Merchant discovery" = PAL[1], "Category expansion" = PAL[2],
+              "Habit channel" = PAL[4], "Deprioritise" = PAL[6])
+
+ggplot(sub_map, aes(reach, NCI, colour = Play)) +
+  geom_hline(yintercept = 1.2, linetype = "dashed", colour = "grey55") +
+  geom_vline(xintercept = 0.60, linetype = "dashed", colour = "grey55") +
+  geom_linerange(aes(ymin = NCI_lo, ymax = NCI_hi), alpha = .45, size = .8) +
+  geom_point(aes(size = demand_share), alpha = .9) +
+  geom_text(aes(label = subsector_id), size = 2.8, vjust = -1.4, colour = "grey25",
+            show.legend = FALSE) +
+  scale_x_continuous(labels = percent) +
+  scale_size_continuous(range = c(2.5, 11), labels = percent, name = "Share of volume") +
+  scale_colour_manual(values = pal_play, name = NULL) +
+  guides(colour = guide_legend(nrow = 1, order = 1, override.aes = list(size = 4))) +
+  labs(title = "Where to point the Q4 promotions programme",
+       subtitle = "Novelty Capture Index (with 95% intervals) against the share of cards already using the category",
+       x = "Card reach - share of cardholders already active in the subsector",
+       y = "Novelty Capture Index",
+       caption = "Bubble size = share of incumbent transactions. Subsectors with 300+ incumbent transactions.")
+```
+
+```{r play-summary}
+sub_map %>% group_by(Play) %>%
+  summarise(Subsectors = n(),
+            `Share of volume` = percent(sum(demand_share), 0.1),
+            `Blended yield /1000` = round(sum(nov_txns) / sum(inc_txns) * 1000),
+            `Avg ticket` = round(mean(avg_ticket)), .groups = "drop") %>%
+  arrange(desc(`Share of volume`)) %>% kable()
+```
+
+The four quadrants are four different instructions, not four rankings:
+
+- **Habit channel** — subsectors 33, 37, 19, 34, 29, 16, 7. Together **78% of
+  all volume**, reached by 78–97% of cards, and a blended discovery yield of
+  878 first-visits per 1,000 incumbent transactions, below the network average
+  of 1,075. Cardholders come here out of routine. *Do not discount here — use
+  it as the delivery channel. Subsector 33 touches 97% of cards; that is not a
+  segment, it is a broadcast medium.*
+- **Merchant discovery** — subsectors 27 and 1. Already reached by 89% and 78%
+  of cards, yet cardholders keep trying **new merchants** inside them. The
+  category does not need introducing; individual merchants do. *Run
+  merchant-level discovery offers here.*
+- **Category expansion** — subsectors 20, 18, 32, 36, 31, 12, 30, 25. High
+  novelty capture but reached by only 27–56% of cards, and the highest tickets
+  in the network (R$93–R$315). *These categories need introducing, and the
+  cardholder who takes the offer spends more.*
+- **Deprioritise** — subsectors 21, 39, 15, 41, 8. Either indistinguishable
+  from average or genuinely habitual on a narrow base.
+
+## Who to send it to: subsector affinity
+
+The play tells us *where*. Affinity tells us *whom*. For every pair of
+subsectors we compute **lift** — how much more likely a card is to use both
+than chance would predict — from a card × subsector incidence matrix.
+
+```{r affinity}
+pres <- hist_ok %>% distinct(card_id, subsector_id) %>%
+  mutate(present = 1L) %>%
+  pivot_wider(names_from = subsector_id, values_from = present, values_fill = 0)
+
+M <- as.matrix(pres[, -1]); storage.mode(M) <- "double"
+n_cards <- nrow(M)
+co   <- crossprod(M) / n_cards            # joint support for every pair
+supp <- diag(co)                          # single-subsector support
+lift_m <- co / outer(supp, supp)
+
+idx <- which(upper.tri(lift_m), arr.ind = TRUE)
+ids <- as.numeric(colnames(M))
+affinity <- data.frame(A = ids[idx[, 1]], B = ids[idx[, 2]],
+                       supp_A = supp[idx[, 1]], supp_B = supp[idx[, 2]],
+                       joint = co[idx], lift = lift_m[idx]) %>%
+  filter(supp_A >= 0.10, supp_B >= 0.10, joint >= 0.05) %>%
+  arrange(desc(lift))
+
+cat("Qualifying subsector pairs:", nrow(affinity))
+
+affinity %>% head(10) %>%
+  transmute(`Subsector A` = A, `Subsector B` = B,
+            `Reach A` = percent(supp_A, 0.1), `Reach B` = percent(supp_B, 0.1),
+            `Both` = percent(joint, 0.1), Lift = round(lift, 2)) %>%
+  kable(caption = "Strongest complementary pairs")
+```
+
+```{r universality}
+data.frame(Subsector = c(33, 29, 34, 16, 37, 19, 27, 25, 12, 31),
+           `Card reach` = percent(supp[as.character(c(33, 29, 34, 16, 37, 19,
+                                                      27, 25, 12, 31))], 0.1),
+           check.names = FALSE) %>%
+  kable(caption = "Reach of the largest and of the targetable subsectors")
+```
+
+**The finding that changes how a campaign is built.** The biggest subsectors
+are *universal* — 33 reaches 97% of cards, 29 reaches 96%, 34 reaches 91%.
+A variable that nearly everyone shares carries **no targeting information**:
+its lift against anything is approximately 1.0. All the discriminating signal
+lives in the mid-reach subsectors, and that is where the usable pairs are:
+a card active in subsector 9 is **1.74×** more likely than chance to also be
+active in 12, and 68% of cards active in 12 are also active in 25.
+
+So the campaign design writes itself: **select** on mid-reach behaviour,
+**deliver** through the universal categories, and **point** the offer at a
+category-expansion subsector the card has not yet used.
+
+## Sizing the prize
+
+```{r scenario}
+hab <- sub_map %>% filter(Play == "Habit channel")
+dis <- sub_map %>% filter(verdict == "Discovery")
+
+y_hab <- sum(hab$nov_txns) / sum(hab$inc_txns) * 1000
+y_dis <- sum(dis$nov_txns) / sum(dis$inc_txns) * 1000
+y_net <- Nn / Ni * 1000
+shift <- 0.33
+exposure <- sum(hab$inc_txns) * shift
+
+data.frame(
+  Line = c("Network-wide discovery yield (per 1,000 incumbent transactions)",
+           "Habit-channel yield",
+           "Discovery-subsector yield",
+           "Ratio, discovery to habit",
+           sprintf("Exposure reallocated (%.0f%% of habit-channel volume)", shift * 100),
+           "First-visits at habit yield",
+           "First-visits at discovery yield",
+           "Difference, per equivalent exposure"),
+  Value = c(comma(round(y_net)), comma(round(y_hab)), comma(round(y_dis)),
+            sprintf("%.2fx", y_dis / y_hab),
+            comma(round(exposure)),
+            comma(round(exposure * y_hab / 1000)),
+            comma(round(exposure * y_dis / 1000)),
+            comma(round(exposure * (y_dis - y_hab) / 1000)))) %>% kable()
+```
+
+This is a rate comparison, not a causal forecast, and it should be presented
+that way: **the same promotional exposure placed in discovery subsectors
+coincides with 2.35× as many first-visits as it does in habit subsectors.**
+The mechanism still has to be proven with a holdout test. But the size of the
+gap is what justifies running that test in Q4 rather than next year.
+
+---
+
+# Recommendations for Q4
+
+**1. Stop discounting habit. Redirect that budget to discovery.**
+The habit channel is 78% of volume at a discovery yield of 878 per 1,000 —
+below the network average. The discovery subsectors run at 2,060. Moving a
+third of habit-channel promotional emphasis is worth roughly **28,000 extra
+first-visits per equivalent exposure**, a 2.35× rate difference.
+
+**2. Split the discovery budget two ways, because it is two different jobs.**
+Subsectors 27 and 1 are already reached by most cardholders — run
+*merchant-level* offers there. Subsectors 20, 18, 32, 36, 31, 12, 30, 25 are
+reached by fewer than 56% — run *category introduction* offers there, and note
+that these carry the highest tickets in the network (up to R$315).
+
+**3. Use subsector 33 as a channel, not a target.**
+It touches 97% of cards and has an NCI of 0.42 (95% CI 0.41–0.43). Discounting
+there buys transactions that were already happening. Its coverage index of
+0.50 says the real constraint is merchant supply — so **recruit merchants
+there instead of discounting cardholders.**
+
+**4. Promote down the pyramid, not up it.**
+Tier A merchants are 0.3% of the base and 26% of incumbent volume, but only
+17% of new-merchant volume. Reserve a defined share of Q4 slots for
+**accelerating tier C and D merchants**, where new relationships actually form
+and where the merchant will co-fund the offer.
+
+**5. Answer the `category_1` question before spending.**
+That flag carries **4.3× the odds of a decline** and covers 6.1% of volume.
+Promoting into a population we then turn away costs money twice. One week of
+risk-team time, closed before the Q4 calendar locks.
+
+**6. Use instalments in exactly one place: the first visit.**
+Instalment use nearly doubles at new merchants. An instalment-linked offer at
+a *known* merchant fights the network's nature; at a first visit it works with
+it. This is the only instalment play the data supports.
+
+**7. Run a reactivation wave off the lapse index, not off recency.**
+**191 cards — 41% of the scored base, holding 31% of spend** — are past three
+times their own normal gap between active days. That list is built from each
+card's own rhythm, so it excludes the monthly shopper who is behaving
+perfectly normally. Retention after activation is strong (above 70% at twelve
+months), which means cards that go quiet are the exception and worth chasing.
+
+**8. Segment the send.**
+Core Everyday (72% of spend) needs **retention and top-of-wallet defence**, not
+discounts. Big-Ticket Narrow (43 days since last transaction) needs
+**reactivation**. Explorer Light is the natural **discovery audience**.
+Occasional — a third of cards and 8.7% of spend — should be the last call on
+the budget, not the first.
+
+---
+
+# What this analysis cannot tell you
+
+Stating the limits is part of the answer.
+
+1. **No card-level loyalty file.** `train.csv` — with `first_active_month` and
+   the loyalty `target` — was not in the export. We rebuilt tenure and value
+   from observed behaviour, so we can describe what loyal behaviour *looks
+   like* but cannot explain the score the business already computes.
+2. **The two windows are different card samples.** 16 cards in common, so
+   every novelty finding is a portfolio-level comparison, not a within-card
+   before/after. It supports "where discovery happens"; it does not support
+   "this promotion caused this card to switch".
+3. **463 cards is a small panel.** Portfolio-level conclusions on instalment
+   mix, ticket size and concentration are stable — and where they are not, we
+   have attached an interval. Cohort cells of 8–32 cards are indicative only,
+   which is why the retention curve is pooled rather than read cohort by
+   cohort.
+4. **Everything is anonymised.** We can say subsector 27 behaves like a
+   merchant-discovery category and 33 like a habit category. Someone inside
+   Elo has to put the names on them before this becomes a media plan.
+5. **The currency transform is empirically recovered, not supplied.** It
+   survives a Benford test at acceptable conformity and produces an
+   economically coherent distribution, but it should still be confirmed
+   against one known settlement record before any figure is quoted externally.
+6. **Correlation, not causation.** The targeting map ranks where discovery
+   already happens and the scenario in Section 10 is a rate comparison. Proving
+   a promotion *causes* a first visit needs a holdout test, which is the
+   natural next piece of work and the one thing we would ask the Board to fund.
+
+---
+
+# Major learnings
+
+- **Audit before you analyse.** 90% of the largest file was empty padding and
+  a hundred records were about to hijack every average. Neither was flagged.
+  The first hour of data work protected every number that followed.
+- **Make the data speak the Board's language.** Recovering the currency
+  transform changed nothing statistically and changed everything about whether
+  the analysis could be presented. "The median ticket is −0.69" is not a
+  finding; "the median ticket is R$35" is a strategy.
+- **Test your own assumptions with someone else's method.** We derived the
+  currency transform ourselves, so we validated it with Benford's Law — a test
+  from forensic accounting that we had no hand in designing. The deviation it
+  found turned out to be Brazilian price points, which corroborated the
+  transform twice over.
+- **A point estimate is an opinion; an interval is a finding.** Two subsectors
+  looked like discovery categories until their confidence intervals crossed the
+  threshold. Attaching intervals to the Novelty Capture Index changed which
+  subsectors got budget.
+- **Ratios travel further than totals.** Raw volume said "promote subsector
+  33, it is huge". Volume *relative to* novelty, reach and supply said the
+  opposite. Constructed indices changed the answer.
+- **A variable everyone shares cannot target anything.** Subsector 33 reaches
+  97% of cards, so its lift against everything is 1.0. The most-used category
+  turned out to be the least useful selector — and the best delivery channel.
+- **Measure people against themselves.** Days-since-last-transaction is
+  meaningless across cards with different rhythms. Dividing by each card's own
+  median gap turned a useless recency column into a 191-card reactivation list.
+- **State the limits in the room.** Naming the 16-card overlap up front made
+  the rest of the analysis credible rather than fragile.

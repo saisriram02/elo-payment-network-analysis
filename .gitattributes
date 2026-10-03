@@ -1,0 +1,10 @@
+# Normalise line endings
+* text=auto
+
+# Binary files
+*.png  binary
+*.pptx binary
+
+# The HTML report is generated from Elo_Analysis.Rmd. Marking it as generated
+# keeps GitHub from showing this repository as an "HTML" project.
+Elo_Analysis.html linguist-generated

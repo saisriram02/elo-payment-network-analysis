@@ -1,0 +1,25 @@
+# ---- Data (from Kaggle, not shared - see Data/README.md) ----
+Data/*
+!Data/README.md
+
+# ---- Old drafts and course submission copies ----
+SUBMISSION/
+Outputs/
+_charts/
+Case Study of Elo.docx
+
+# ---- R and R Markdown ----
+.Rhistory
+.RData
+.Rproj.user/
+*_cache/
+Elo_Analysis_files/
+*.tex
+*.log
+figures/elo_figures.pdf
+
+# ---- Office and system temp files ----
+~$*
+.DS_Store
+Thumbs.db
+desktop.ini
